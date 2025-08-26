@@ -1,0 +1,192 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "S3 Block Public Access Custom Resource - Enables full BPA protection at AWS account level with optional SNS notifications",
+  "Parameters": {
+    "NotificationTopicArn": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional SNS Topic ARN for notifications (leave empty to disable notifications)"
+    }
+  },
+  "Conditions": {
+    "HasNotificationTopic": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "NotificationTopicArn"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "S3BPALambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "S3BlockPublicAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetAccountPublicAccessBlock",
+                    "s3:PutAccountPublicAccessBlock",
+                    "sts:GetCallerIdentity"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sns:Publish"
+                  ],
+                  "Resource": {
+                    "Fn::If": [
+                      "HasNotificationTopic",
+                      {
+                        "Ref": "NotificationTopicArn"
+                      },
+                      {
+                        "Ref": "AWS::NoValue"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "S3BPALambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-s3-bpa-handler"
+        },
+        "Runtime": "python3.11",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "S3BPALambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 300,
+        "MemorySize": 128,
+        "Code": {
+          "ZipFile": "import json\nimport logging\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom datetime import datetime\nimport urllib3\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\ndef get_account_id():\n    \"\"\"Get AWS Account ID from STS\"\"\"\n    sts_client = boto3.client('sts')\n    return sts_client.get_caller_identity()['Account']\n\ndef get_current_bpa_config(account_id):\n    try:\n        s3control_client = boto3.client('s3control')\n        response = s3control_client.get_public_access_block(AccountId=account_id)\n        config = response.get('PublicAccessBlockConfiguration', {})\n        return {\n            'BlockPublicAcls': config.get('BlockPublicAcls', True),\n            'IgnorePublicAcls': config.get('IgnorePublicAcls', True),\n            'BlockPublicPolicy': config.get('BlockPublicPolicy', True),\n            'RestrictPublicBuckets': config.get('RestrictPublicBuckets', True)\n        }\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'NoSuchPublicAccessBlockConfiguration':\n            return None\n        raise\n\ndef apply_bpa_config(config, account_id):\n    s3control_client = boto3.client('s3control')\n    s3control_client.put_public_access_block(\n        AccountId=account_id,\n        PublicAccessBlockConfiguration=config\n    )\n    return config\n\ndef configs_equal(current, desired):\n    if current is None:\n        return False\n    return (current['BlockPublicAcls'] == desired['BlockPublicAcls'] and\n            current['IgnorePublicAcls'] == desired['IgnorePublicAcls'] and\n            current['BlockPublicPolicy'] == desired['BlockPublicPolicy'] and\n            current['RestrictPublicBuckets'] == desired['RestrictPublicBuckets'])\n\ndef get_desired_config():\n    \"\"\"Always return full BPA configuration - all settings enabled for maximum security\"\"\"\n    return {\n        'BlockPublicAcls': True,\n        'IgnorePublicAcls': True,\n        'BlockPublicPolicy': True,\n        'RestrictPublicBuckets': True\n    }\n\ndef send_sns_notification(topic_arn, subject, message):\n    if not topic_arn:\n        return\n    \n    try:\n        sns_client = boto3.client('sns')\n        sns_client.publish(\n            TopicArn=topic_arn,\n            Subject=subject,\n            Message=message\n        )\n        logger.info(f\"SNS notification sent to {topic_arn}\")\n    except Exception as e:\n        logger.error(f\"Failed to send SNS notification: {str(e)}\")\n\ndef send_response(event, context, status, reason, data=None):\n    response_body = {\n        'Status': status,\n        'Reason': reason,\n        'PhysicalResourceId': event.get('PhysicalResourceId', f\"account-bpa-{context.aws_request_id}\"),\n        'StackId': event['StackId'],\n        'RequestId': event['RequestId'],\n        'LogicalResourceId': event['LogicalResourceId']\n    }\n    \n    if data:\n        response_body['Data'] = data\n    \n    response_url = event['ResponseURL']\n    \n    try:\n        http = urllib3.PoolManager()\n        response = http.request('PUT', response_url, \n                              body=json.dumps(response_body),\n                              headers={'Content-Type': 'application/json'})\n        logger.info(f\"Response sent: {response.status}\")\n    except Exception as e:\n        logger.error(f\"Failed to send response: {str(e)}\")\n\ndef handle_create(event, context, properties):\n    logger.info(\"Handling CREATE operation - applying full S3 Block Public Access\")\n    \n    account_id = get_account_id()\n    desired_config = get_desired_config()  # Always full BPA protection\n    current_config = get_current_bpa_config(account_id)\n    topic_arn = properties.get('NotificationTopicArn')\n    \n    if configs_equal(current_config, desired_config):\n        logger.info(\"S3 Block Public Access already fully enabled\")\n        config_changed = False\n        final_config = current_config\n        message = \"S3 Block Public Access already fully enabled at account level\"\n    else:\n        logger.info(\"Enabling full S3 Block Public Access protection\")\n        final_config = apply_bpa_config(desired_config, account_id)\n        config_changed = True\n        message = \"S3 Block Public Access fully enabled at account level\"\n    \n    data = {\n        'BlockPublicAcls': final_config['BlockPublicAcls'],\n        'IgnorePublicAcls': final_config['IgnorePublicAcls'],\n        'BlockPublicPolicy': final_config['BlockPublicPolicy'],\n        'RestrictPublicBuckets': final_config['RestrictPublicBuckets'],\n        'ConfigurationChanged': config_changed,\n        'Timestamp': datetime.utcnow().isoformat()\n    }\n    \n    notification_message = {\n        'Status': 'SUCCESS',\n        'Message': message,\n        'AccountId': account_id,\n        'Configuration': final_config,\n        'ConfigurationChanged': config_changed,\n        'Timestamp': data['Timestamp']\n    }\n    \n    send_sns_notification(\n        topic_arn,\n        'S3 Block Public Access - Configuration Applied',\n        json.dumps(notification_message, indent=2)\n    )\n    \n    send_response(event, context, 'SUCCESS', message, data)\n\ndef lambda_handler(event, context):\n    logger.info(f\"Received {event['RequestType']} request\")\n    \n    try:\n        request_type = event['RequestType']\n        properties = event.get('ResourceProperties', {})\n        topic_arn = properties.get('NotificationTopicArn')\n        \n        if request_type == 'Create':\n            handle_create(event, context, properties)\n        elif request_type in ['Update', 'Delete']:\n            logger.info(f\"{request_type} operation - no action needed, returning success\")\n            data = {\n                'Message': f'{request_type} operation completed - no changes made',\n                'Timestamp': datetime.utcnow().isoformat()\n            }\n            send_response(event, context, 'SUCCESS', f'{request_type} operation completed', data)\n        else:\n            raise ValueError(f\"Unsupported request type: {request_type}\")\n            \n    except ClientError as e:\n        error_code = e.response['Error']['Code']\n        error_message = e.response['Error']['Message']\n        logger.error(f\"AWS API error: {error_code} - {error_message}\")\n        \n        if error_code == 'AccessDenied':\n            reason = \"Insufficient permissions to modify S3 Block Public Access settings\"\n        else:\n            reason = f\"AWS API error: {error_code}\"\n        \n        notification_message = {\n            'Status': 'FAILED',\n            'Error': reason,\n            'ErrorCode': error_code,\n            'Timestamp': datetime.utcnow().isoformat()\n        }\n        \n        topic_arn = event.get('ResourceProperties', {}).get('NotificationTopicArn')\n        send_sns_notification(\n            topic_arn,\n            'S3 Block Public Access - Configuration Failed',\n            json.dumps(notification_message, indent=2)\n        )\n            \n        send_response(event, context, 'FAILED', reason)\n        \n    except Exception as e:\n        logger.error(f\"Unexpected error: {str(e)}\")\n        \n        notification_message = {\n            'Status': 'FAILED',\n            'Error': f'Internal error: {str(e)}',\n            'Timestamp': datetime.utcnow().isoformat()\n        }\n        \n        topic_arn = event.get('ResourceProperties', {}).get('NotificationTopicArn')\n        send_sns_notification(\n            topic_arn,\n            'S3 Block Public Access - Internal Error',\n            json.dumps(notification_message, indent=2)\n        )\n        \n        send_response(event, context, 'FAILED', f\"Internal error: {str(e)}\")"
+        }
+      }
+    },
+    "S3BlockPublicAccessResource": {
+      "Type": "AWS::CloudFormation::CustomResource",
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "S3BPALambdaFunction",
+            "Arn"
+          ]
+        },
+        "NotificationTopicArn": {
+          "Fn::If": [
+            "HasNotificationTopic",
+            {
+              "Ref": "NotificationTopicArn"
+            },
+            {
+              "Ref": "AWS::NoValue"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "AccountId": {
+      "Description": "AWS Account ID where S3 Block Public Access was configured",
+      "Value": {
+        "Fn::Sub": "${AWS::AccountId}"
+      }
+    },
+    "S3BlockPublicAccessStatus": {
+      "Description": "Current S3 Block Public Access status (all settings enabled)",
+      "Value": "Fully Enabled - All 4 BPA settings are active"
+    },
+    "BlockPublicAcls": {
+      "Description": "Block Public ACLs status",
+      "Value": {
+        "Fn::GetAtt": [
+          "S3BlockPublicAccessResource",
+          "BlockPublicAcls"
+        ]
+      }
+    },
+    "IgnorePublicAcls": {
+      "Description": "Ignore Public ACLs status",
+      "Value": {
+        "Fn::GetAtt": [
+          "S3BlockPublicAccessResource",
+          "IgnorePublicAcls"
+        ]
+      }
+    },
+    "BlockPublicPolicy": {
+      "Description": "Block Public Policy status",
+      "Value": {
+        "Fn::GetAtt": [
+          "S3BlockPublicAccessResource",
+          "BlockPublicPolicy"
+        ]
+      }
+    },
+    "RestrictPublicBuckets": {
+      "Description": "Restrict Public Buckets status",
+      "Value": {
+        "Fn::GetAtt": [
+          "S3BlockPublicAccessResource",
+          "RestrictPublicBuckets"
+        ]
+      }
+    },
+    "ConfigurationChanged": {
+      "Description": "Whether BPA configuration was changed during deployment",
+      "Value": {
+        "Fn::GetAtt": [
+          "S3BlockPublicAccessResource",
+          "ConfigurationChanged"
+        ]
+      }
+    },
+    "LastUpdated": {
+      "Description": "Timestamp when BPA configuration was last processed",
+      "Value": {
+        "Fn::GetAtt": [
+          "S3BlockPublicAccessResource",
+          "Timestamp"
+        ]
+      }
+    }
+  }
+}
