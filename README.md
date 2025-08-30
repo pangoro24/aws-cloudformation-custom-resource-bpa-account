@@ -2,6 +2,9 @@
 
 A simplified CloudFormation Custom Resource for managing S3 Block Public Access settings at the AWS account level.
 
+Read more in dev.to: https://dev.to/pangoro24/cloudformation-custom-resources-en-espanol-sencillo-1p17
+
+
 ## Quick Start
 
 ### Basic Deployment (No Notifications)
